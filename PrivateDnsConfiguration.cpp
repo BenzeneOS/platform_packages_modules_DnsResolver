@@ -139,10 +139,17 @@ int PrivateDnsConfiguration::set(int32_t netId, uint32_t mark,
         // TODO: signal validation threads to stop.
     }
 
-    if (int n = setDot(netId, mark, encryptedServers, name, caCert); n != 0) {
-        return n;
+    // If name is a full DoH URL, use DoH only (DoT can't use URLs with paths)
+    if (name.rfind("https://", 0) == 0) {
+        LOG(INFO) << "URL provided: using DoH only, skipping DoT";
+        clearDot(netId);
+        return setDoh(netId, mark, encryptedServers, name, caCert, dohParams);
     }
 
+    // Hostname provided - try both DoT and DoH
+    if (int err = setDot(netId, mark, encryptedServers, name, caCert); err != 0) {
+        return err;
+    }
     return setDoh(netId, mark, encryptedServers, name, caCert, dohParams);
 }
 
@@ -676,6 +683,45 @@ base::Result<PrivateDnsConfiguration::DohIdentity> PrivateDnsConfiguration::make
 
             return dohId;
         }
+    }
+
+    // 3. Universal fallback: support any provider with a strict mode hostname or full URL.
+    if (!name.empty() && !servers.empty()) {
+        const std::vector<std::string> sortedServers = sortServers(servers);
+        std::string httpsTemplate;
+        std::string host;
+
+        // Check if name is a full URL (starts with https://)
+        if (name.rfind("https://", 0) == 0) {
+            // Use the URL directly as the template
+            httpsTemplate = name;
+            // Extract host from URL for TLS SNI
+            // URL format: https://host[:port][/path]
+            size_t hostStart = 8;  // strlen("https://")
+            size_t hostEnd = name.find('/', hostStart);
+            if (hostEnd == std::string::npos) {
+                hostEnd = name.length();
+            }
+            size_t portPos = name.find(':', hostStart);
+            if (portPos != std::string::npos && portPos < hostEnd) {
+                host = name.substr(hostStart, portPos - hostStart);
+            } else {
+                host = name.substr(hostStart, hostEnd - hostStart);
+            }
+            LOG(INFO) << fmt::format("makeDohIdentity: Using full DoH URL {}, host={}", name, host);
+        } else {
+            // Construct standard RFC 8484 DoH URL from the hostname
+            httpsTemplate = fmt::format("https://{}/dns-query", name);
+            host = name;
+            LOG(INFO) << fmt::format("makeDohIdentity: Universal DoH fallback for {}", name);
+        }
+
+        return DohIdentity{
+                .httpsTemplate = httpsTemplate,
+                .ipAddr = sortedServers[0],
+                .host = host,
+                .status = Validation::in_process,
+        };
     }
 
     return Errorf("Cannot make a DohIdentity from current DNS configuration");
